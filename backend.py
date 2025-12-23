@@ -66,7 +66,7 @@ def format_views(views):
     return f"{views} views"
 
 # --------------------
-# FETCH INFO
+# FETCH VIDEO INFO
 # --------------------
 @app.route("/api/fetch", methods=["POST"])
 def fetch_video():
@@ -76,8 +76,17 @@ def fetch_video():
     if not url or not validate_youtube_url(url):
         return jsonify({"error": "Invalid YouTube URL"}), 400
 
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "cookiefile": "cookies.txt"  # <--- add cookie support
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
     formats, seen = [], set()
     for f in info.get("formats", []):
@@ -125,17 +134,18 @@ def download_worker(download_id, url, quality):
                     (d.get("downloaded_bytes", 0) / total) * 100, 99
                 )
 
-    opts = {
+    ydl_opts = {
         "format": f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best",
         "outtmpl": str(filepath.with_suffix(".%(ext)s")),
         "merge_output_format": "mp4",
         "progress_hooks": [hook],
         "quiet": True,
         "no_warnings": True,
+        "cookiefile": "cookies.txt"  # <--- add cookie support
     }
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         downloads[download_id].update({
@@ -151,7 +161,7 @@ def download_worker(download_id, url, quality):
         }
 
 # --------------------
-# STREAM ENDPOINT
+# STREAM DOWNLOAD PROGRESS
 # --------------------
 @app.route("/api/download/stream")
 def download_stream():

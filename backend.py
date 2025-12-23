@@ -1,4 +1,4 @@
-# backend.py - Optimized Flask Backend for YouTube Downloader
+# backend.py - Chunked YouTube Downloader with cookies support
 
 from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
@@ -15,7 +15,10 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
-DOWNLOAD_TTL = 600        # 10 minutes
+# --------------------
+# CONFIG
+# --------------------
+DOWNLOAD_TTL = 600  # 10 minutes
 RATE_LIMIT = 3
 RATE_WINDOW = 600
 downloads = defaultdict(dict)
@@ -23,8 +26,10 @@ downloads = defaultdict(dict)
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+COOKIE_FILE = "cookies.txt"  # Make sure this file exists in your project
+
 # --------------------
-# Helpers
+# HELPERS
 # --------------------
 def get_ip():
     return request.headers.get("X-Forwarded-For", request.remote_addr)
@@ -43,7 +48,7 @@ def validate_youtube_url(url):
     return "youtube.com" in url or "youtu.be" in url
 
 # --------------------
-# Download Worker (streamed)
+# DOWNLOAD WORKER
 # --------------------
 def download_worker(download_id, url, height):
     downloads[download_id] = {"status": "downloading", "progress": 0, "filename": None, "created": time.time()}
@@ -53,13 +58,14 @@ def download_worker(download_id, url, height):
         "format": f"bestvideo[height<={height}]+bestaudio/best",
         "quiet": True,
         "no_warnings": True,
+        "cookiefile": COOKIE_FILE
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             video_url = info.get("url")
-            
+
         # Stream download in chunks
         with requests.get(video_url, stream=True) as r, open(filepath, "wb") as f:
             total = int(r.headers.get("content-length", 0))
@@ -76,10 +82,14 @@ def download_worker(download_id, url, height):
         downloads[download_id].update({"status": "error", "error": str(e)})
 
 # --------------------
-# SSE Progress Stream
+# STREAM PROGRESS SSE
 # --------------------
 @app.route("/api/download/stream")
 def download_stream():
+    ip = get_ip()
+    if rate_limited(ip):
+        return jsonify({"error": "Too many downloads, slow down"}), 429
+
     url = request.args.get("url")
     quality = request.args.get("quality", "720p")
     download_id = str(uuid.uuid4())
@@ -112,7 +122,7 @@ def download_stream():
     return Response(gen(), mimetype="text/event-stream")
 
 # --------------------
-# Serve Downloaded File
+# SERVE DOWNLOADED FILE
 # --------------------
 @app.route("/api/download/file/<filename>")
 def download_file(filename):
@@ -127,7 +137,7 @@ def download_file(filename):
     return resp
 
 # --------------------
-# Cleanup Thread
+# CLEANUP THREAD
 # --------------------
 def cleanup_loop():
     while True:
@@ -145,7 +155,7 @@ def cleanup_loop():
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
 # --------------------
-# Run
+# RUN
 # --------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

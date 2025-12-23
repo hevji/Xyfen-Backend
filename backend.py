@@ -1,15 +1,15 @@
-# backend.py - Chunked YouTube Downloader with cookies support
+# backend.py - YouTube Downloader with Cookies & Render support
 
 from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
 import yt_dlp
+import re
 import os
+import json
 import time
 import uuid
 import threading
 from pathlib import Path
-from collections import defaultdict
-import json
 import requests
 
 app = Flask(__name__)
@@ -18,145 +18,109 @@ CORS(app)
 # --------------------
 # CONFIG
 # --------------------
-DOWNLOAD_TTL = 600  # 10 minutes
-RATE_LIMIT = 3
-RATE_WINDOW = 600
-downloads = defaultdict(dict)
-
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+COOKIE_FILE = "cookies.txt"  # Required for age-restricted / anti-bot
 
-COOKIE_FILE = "cookies.txt"  # Make sure this file exists in your project
+downloads = {}
 
 # --------------------
 # HELPERS
 # --------------------
-def get_ip():
-    return request.headers.get("X-Forwarded-For", request.remote_addr)
-
-def rate_limited(ip):
-    now = time.time()
-    if ip not in downloads:
-        downloads[ip] = []
-    downloads[ip] = [t for t in downloads[ip] if now - t < RATE_WINDOW]
-    if len(downloads[ip]) >= RATE_LIMIT:
-        return True
-    downloads[ip].append(now)
-    return False
-
 def validate_youtube_url(url):
-    return "youtube.com" in url or "youtu.be" in url
+    youtube_regex = r'^(https?://)?(www.)?(youtube.com/(watch\?v=|embed/|v/|shorts/)|youtu.be/)[a-zA-Z0-9_-]{11}'
+    return bool(re.match(youtube_regex, url))
 
 # --------------------
 # DOWNLOAD WORKER
 # --------------------
-def download_worker(download_id, url, height):
-    downloads[download_id] = {"status": "downloading", "progress": 0, "filename": None, "created": time.time()}
+def download_worker(download_id, url, quality):
+    downloads[download_id] = {'status': 'downloading', 'progress': 0}
+    height = int(quality.replace('p', ''))
     filepath = DOWNLOAD_DIR / f"{download_id}.mp4"
 
     ydl_opts = {
-        "format": f"bestvideo[height<={height}]+bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "cookiefile": COOKIE_FILE
+        'format': f'bestvideo[height<={height}]+bestaudio/best',
+        'outtmpl': str(filepath.with_suffix('.%(ext)s')),
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_FILE,
     }
+
+    def hook(d):
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            downloaded = d.get('downloaded_bytes', 0)
+            if total > 0:
+                downloads[download_id]['progress'] = min((downloaded/total)*100, 99)
+        elif d['status'] == 'finished':
+            downloads[download_id]['progress'] = 100
+            downloads[download_id]['status'] = 'ready'
+
+    ydl_opts['progress_hooks'] = [hook]
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_url = info.get("url")
-
-        # Stream download in chunks
-        with requests.get(video_url, stream=True) as r, open(filepath, "wb") as f:
-            total = int(r.headers.get("content-length", 0))
-            downloaded = 0
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        downloads[download_id]["progress"] = min((downloaded / total) * 100, 100)
-
-        downloads[download_id].update({"status": "ready", "progress": 100, "filename": filepath.name})
+            ydl.download([url])
+        downloads[download_id]['filename'] = filepath.name
     except Exception as e:
-        downloads[download_id].update({"status": "error", "error": str(e)})
+        downloads[download_id] = {'status': 'error', 'error': str(e), 'progress': 0}
 
 # --------------------
-# STREAM PROGRESS SSE
+# STREAM PROGRESS
 # --------------------
-@app.route("/api/download/stream")
+@app.route('/api/download/stream')
 def download_stream():
-    ip = get_ip()
-    if rate_limited(ip):
-        return jsonify({"error": "Too many downloads, slow down"}), 429
+    url = request.args.get('url', '')
+    quality = request.args.get('quality', '720p')
+    download_id = request.args.get('id', str(uuid.uuid4()))
 
-    url = request.args.get("url")
-    quality = request.args.get("quality", "720p")
-    download_id = str(uuid.uuid4())
-    height = int(quality.replace("p", ""))
+    if not url or not validate_youtube_url(url):
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
 
-    threading.Thread(target=download_worker, args=(download_id, url, height), daemon=True).start()
+    threading.Thread(target=download_worker, args=(download_id, url, quality), daemon=True).start()
 
-    def gen():
-        last_progress = -1
+    def generate():
         while True:
-            d = downloads.get(download_id)
-            if not d:
+            status = downloads.get(download_id)
+            if not status:
                 break
-            status = d.get("status")
-            progress = int(d.get("progress", 0))
+            if status['status'] in ['downloading']:
+                yield f"data: {json.dumps({'type':'progress','progress':status['progress']})}\n\n"
+            elif status['status'] == 'ready':
+                yield f"data: {json.dumps({'type':'complete','filename':status['filename']})}\n\n"
+                break
+            elif status['status'] == 'error':
+                yield f"data: {json.dumps({'type':'error','message':status.get('error','Unknown')})}\n\n"
+                break
+            time.sleep(0.1)
 
-            if progress != last_progress or status in ["ready", "error"]:
-                last_progress = progress
-                if status == "ready":
-                    yield f"data: {json.dumps({'type':'complete','filename':d['filename']})}\n\n"
-                    break
-                elif status == "error":
-                    yield f"data: {json.dumps({'type':'error','message':d['error']})}\n\n"
-                    break
-                else:
-                    yield f"data: {json.dumps({'type':'progress','progress':progress})}\n\n"
-
-            time.sleep(0.1)  # tiny sleep to prevent tight loop
-
-    return Response(gen(), mimetype="text/event-stream")
+    return Response(generate(), mimetype='text/event-stream')
 
 # --------------------
-# SERVE DOWNLOADED FILE
+# SERVE FILE
 # --------------------
-@app.route("/api/download/file/<filename>")
+@app.route('/api/download/file/<filename>')
 def download_file(filename):
     path = DOWNLOAD_DIR / filename
     if not path.exists():
-        return jsonify({"error": "Not found"}), 404
-    resp = send_file(path, as_attachment=True)
+        return jsonify({'error': 'File not found'}), 404
+
+    response = send_file(path, as_attachment=True)
     try:
         os.remove(path)
+        for key, val in list(downloads.items()):
+            if val.get('filename') == filename:
+                downloads.pop(key)
     except:
         pass
-    return resp
+
+    return response
 
 # --------------------
-# CLEANUP THREAD
+# START
 # --------------------
-def cleanup_loop():
-    while True:
-        now = time.time()
-        for k, v in list(downloads.items()):
-            if now - v.get("created", now) > DOWNLOAD_TTL:
-                file = v.get("filename")
-                if file:
-                    p = DOWNLOAD_DIR / file
-                    if p.exists():
-                        p.unlink()
-                downloads.pop(k, None)
-        time.sleep(60)
-
-threading.Thread(target=cleanup_loop, daemon=True).start()
-
-# --------------------
-# RUN
-# --------------------
-if __name__ == "__main__":
+if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host='0.0.0.0', port=port, threaded=True)
